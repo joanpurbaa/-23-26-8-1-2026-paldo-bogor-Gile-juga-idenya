@@ -1,0 +1,233 @@
+# Jalur B — Backend
+
+Career & financial resilience platform: membantu pekerja mempersiapkan diri menghadapi PHK dan perubahan dunia kerja sebelum terjadi. See [Plan.md](Plan.md) for the full product spec and [erd.md](erd.md) for the database design.
+
+## Stack
+
+- **FastAPI** + **SQLAlchemy 2 (async)** + **asyncpg**
+- **Alembic** for migrations
+- **PostgreSQL** (Supabase pooler or local)
+- **uv** as package manager
+
+## Setup
+
+```bash
+# 1. Install dependencies
+uv sync
+
+# 2. Configure environment
+cp .env.example .env
+# edit DATABASE_URL to point at your Postgres instance
+
+# 3. Run migrations
+uv run alembic upgrade head
+
+# 4. Start the dev server
+uv run uvicorn main:app --reload
+```
+
+Health check: `GET http://localhost:8000/health`
+
+## Database
+
+Schema source of truth: `jalurB-v2.erd` (+ [erd.md](erd.md)). After changing anything under `app/models/`:
+
+```bash
+uv run alembic revision --autogenerate -m "describe change"
+uv run alembic upgrade head
+```
+
+## Project structure
+
+```
+app/
+├── api/        # route handlers (per-feature routers)
+├── core/       # settings (.env), async engine & session factory
+├── models/     # SQLAlchemy ORM models
+└── schemas/    # Pydantic request/response schemas
+alembic/        # migration environment (wired to app settings + Base.metadata)
+main.py         # FastAPI app entrypoint
+```
+
+## Roadmap (features per Plan.md)
+
+1. Career Health Score
+2. Career Risk Scanner
+3. AI Exposure + Skill Relevance
+4. Career Pivot Map
+5. Career Evidence Vault
+6. Personal Runway
+7. What If I Get Fired?
+
+AI behavior, formulas, score thresholds, and limitations are documented in
+[`AI_SCORING.md`](AI_SCORING.md).
+
+Auth (register/login) is planned next on top of the existing `users` table.
+
+## Authentication
+
+The API supports password registration/login and Google OAuth:
+
+- `POST /api/auth/register`
+- `POST /api/auth/login`
+- `GET /api/auth/me`
+- `POST /api/auth/logout`
+- `GET /api/auth/google/start`
+- `GET /api/auth/google/callback`
+- `POST /api/auth/google/exchange`
+
+Google returns a short-lived, single-use exchange code to the frontend. Access tokens
+are never included in the OAuth redirect URL. A verified Google identity is linked to
+an existing account with the same normalized email only when Google is authoritative for
+the address (`gmail.com` or a matching Google Workspace hosted domain). If that form
+account was not email verified, its password is invalidated and previous tokens are
+revoked during linking to prevent pre-registration account takeover.
+
+Required production environment variables are documented in `.env.example`. Generate a
+unique `JWT_SECRET_KEY`; never reuse the Google client secret as the JWT key.
+Configure SMTP before enabling form registration; in local `DEBUG=true` mode, email
+bodies are written to the backend log.
+
+For a Vercel frontend and separately hosted API:
+
+1. Set `FRONTEND_URL` and `CORS_ORIGINS` to the production Vercel/custom origin.
+2. Set a project-specific `CORS_ORIGIN_REGEX` only if preview deployments need auth.
+3. Set `BACKEND_URL` to the public API origin.
+4. In Google Cloud, register this authorized redirect URI exactly:
+   `https://<api-domain>/api/auth/google/callback`.
+5. Add the frontend production and approved preview origins to Google OAuth's authorized
+   JavaScript origins.
+
+## Onboarding API
+
+All onboarding routes require a verified bearer-token user:
+
+- `GET /api/onboarding` returns completion state, profile, and selected skills.
+- `PUT /api/onboarding` creates or replaces onboarding data idempotently.
+- `GET /api/onboarding/options` returns career goals plus available industries and skills.
+
+`PUT /api/onboarding` accepts canonical backend values:
+
+```json
+{
+  "full_name": "Joan Orlando",
+  "current_role_name": "Backend Engineer",
+  "industry_name": "Technology",
+  "work_duration_months": 24,
+  "is_first_job": false,
+  "daily_activities": "Build and maintain APIs",
+  "career_goal": "level_up",
+  "target_role_name": "Senior Engineer",
+  "target_industry_name": "Technology",
+  "skills": ["Python", "API Design"]
+}
+```
+
+Career-goal values are `grow_current`, `level_up`, `change_role`, `change_industry`, and
+`undecided`. Skill names are case-insensitively unique, and each user may submit 1–8.
+
+## Profile API
+
+Verified users who completed onboarding can use:
+
+- `GET /api/profile` to retrieve account identity, career profile, and selected skills.
+- `PATCH /api/profile` to update profile-owned fields.
+
+## CV Preview API
+
+CV extraction is a two-step review flow. Both write endpoints require a verified user
+with an existing profile:
+
+1. Send a PDF or DOCX as multipart field `file` to `POST /api/profile/cv/preview`.
+2. Display the returned `profile`, `skills`, and `experiences` to the user for review
+   and editing.
+3. Send the reviewed values back to `POST /api/profile/cv/confirm` as a JSON body:
+   `{"preview_token": "...", "profile": {...}, "skills": [...], "experiences": [...]}`.
+
+The preview response has this shape:
+
+```json
+{
+  "preview_id": "6956dcb6-1a73-4f86-8201-249a48d738cd",
+  "preview_token": "<signed one-hour token>",
+  "file_name": "resume.pdf",
+  "file_size": 123456,
+  "content_type": "application/pdf",
+  "expires_at": "2026-09-03T13:00:00Z",
+  "profile": {
+    "full_name": "Joan Orlando",
+    "current_role_name": "Backend Engineer",
+    "industry_name": "Technology",
+    "work_duration_months": 24,
+    "daily_activities": "Membangun dan menjaga API produksi."
+  },
+  "skills": ["Python", "API Design"],
+  "experiences": [],
+  "model": "muse-spark-1.2-contributor-free"
+}
+```
+
+Previewing does not change the profile, skills, career history, or current confirmed CV.
+The backend does not retain an unconfirmed file or database draft; the signed preview token
+expires after one hour and is bound to the authenticated user.
+Confirmation is importer-only: the reviewed values sent by the frontend replace the AI
+extraction. It atomically updates non-null edited profile fields, merges edited skills
+without removing existing skills, and saves the edited experiences as the CV career
+history. Blank profile fields keep the user's existing values. The source CV file is not
+stored on the account.
+The confirmation endpoint is idempotent when retried with the same token.
+Consumed previews cannot overwrite a newer confirmed CV. Files left behind by legacy
+stored CVs and replaced CV objects from deleted accounts are removed through a durable
+retryable storage-cleanup queue.
+
+- `GET /api/profile/cv` returns the confirmed CV career history and the model used.
+- PDF and DOCX are supported up to 5 MB; scanned PDFs without readable text are rejected.
+- CV text is sent to the configured Contributor Free model and may be used for model
+  training. The frontend must disclose this before upload.
+
+Email and username are intentionally not editable through the profile endpoint.
+
+## Master Data API
+
+Verified users can query paginated skill catalogs with `limit`, `offset`, and optional `q`:
+
+- `GET /api/master/skills` (`category` and `market_trend` filters supported)
+
+Responses use `{ "items": [], "total": 0, "limit": 50, "offset": 0 }`.
+
+## Financial API
+
+All financial routes require a verified bearer-token user. Individual assets are the
+source of truth for savings; profile settings only store monthly burn inputs.
+
+- `GET /api/financial` returns settings, assets, totals, and the current runway preview.
+- `PUT /api/financial` creates or replaces monthly expense, debt, dependent, and currency settings.
+- `POST /api/financial/assets` creates an asset.
+- `PATCH /api/financial/assets/{asset_id}` updates an owned asset.
+- `DELETE /api/financial/assets/{asset_id}` deletes an owned asset.
+
+Runway is `liquid assets / (monthly essential expenses + monthly debt payment)`.
+Assets marked `requires_process` or `illiquid` remain in total assets but do not count
+toward runway. All assets must match the profile currency; currency changes are rejected
+while assets exist because this API does not perform foreign-exchange conversion.
+
+## Evidence API
+
+Verified users can manage human-authored career evidence:
+
+- `GET /api/evidence` supports type, text, date, `limit`, and `offset` filters.
+- `POST /api/evidence` creates evidence and always records it as human-authored.
+- `PATCH` and `DELETE /api/evidence/{evidence_id}` operate on owned evidence.
+- `POST /api/evidence/{evidence_id}/attachment` optionally attaches one private file.
+- `DELETE /api/evidence/{evidence_id}/attachment` removes the attached file.
+
+Creating evidence does not require an attachment. Attachments accept PDF, PNG, JPG, or
+WEBP content up to 10 MB and are stored in the configured private Supabase Storage bucket.
+Evidence responses contain a signed attachment URL that expires after 15 minutes.
+
+## Dashboard API
+
+`GET /api/dashboard` returns only stored facts and deterministic arithmetic: account and
+profile identity, onboarding state, skill counts, evidence totals, and current financial
+runway. Missing sections are returned as empty or `null`; no AI scores, generated
+recommendations, or placeholder analysis are included.
